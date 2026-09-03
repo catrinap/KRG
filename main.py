@@ -4,28 +4,17 @@ import openpyxl
 from io import BytesIO
 import logging
 
-# Настройка логирования, чтобы видеть, что происходит
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
 def find_col(ws, header_name):
-    """Ищет номер столбца по названию заголовка (игнорирует регистр и пробелы)"""
+    """Ищет номер столбца по названию заголовка"""
     for cell in ws[1]:
         if cell.value and str(cell.value).strip().lower() == header_name.strip().lower():
             return cell.column
     return None
-
-def get_sheet(wb, possible_names):
-    """Ищет лист по одному из возможных названий"""
-    for name in possible_names:
-        if name in wb.sheetnames:
-            return wb[name]
-    # Если не нашли, выводим в лог реальные названия всех листов для отладки
-    logger.error(f"ЛИСТ НЕ НАЙДЕН! Искомые варианты: {possible_names}")
-    logger.error(f"Реальные названия листов в файле: {wb.sheetnames}")
-    raise ValueError(f"Ни один из листов {possible_names} не найден. Доступны: {wb.sheetnames}")
 
 @app.post("/process")
 async def process_excel(file: UploadFile = File(...)):
@@ -38,8 +27,8 @@ async def process_excel(file: UploadFile = File(...)):
     wb_vals = openpyxl.load_workbook(BytesIO(contents), data_only=True)
     logger.info(f"Названия листов в файле: {wb_vals.sheetnames}")
     
-    # Пытаемся найти лист для чтения старых значений I, J, K
-    ws3_vals = get_sheet(wb_vals, ["Готовый отчет по ТГ", "Отчет по ТГ"])
+    # ИСПРАВЛЕНО: используем правильное название листа
+    ws3_vals = wb_vals["Отчет по ТГ"]
     
     tg_col_3v = find_col(ws3_vals, "Товарная группа")
     existing_values = {}
@@ -69,7 +58,7 @@ async def process_excel(file: UploadFile = File(...)):
     wb = openpyxl.load_workbook(BytesIO(contents), data_only=False)
 
     # --- ЛИСТ 1: "Данные КРГ" → Сводная ---
-    ws1 = get_sheet(wb, ["Данные КРГ"])
+    ws1 = wb["Данные КРГ"]
     
     tg_col_1 = find_col(ws1, "Товарная группа")
     delta_col = find_col(ws1, "Дельта, шт.")
@@ -100,26 +89,37 @@ async def process_excel(file: UploadFile = File(...)):
             summary[tg_name]["retail"] += r
             summary[tg_name]["purchase"] += p
 
-    # --- ЛИСТ 2 и 3: Запись данных ---
-    # Ищем лист, куда нужно вписать T,U,V и обновить I,J,K
-    ws_target = get_sheet(wb, ["Готовый отчет по ТГ", "Отчет по ТГ"])
-    tg_col_target = find_col(ws_target, "Товарная группа")
+    # --- ЛИСТ 2: "Отчет по ТГ" → Вставка в T(20), U(21), V(22) ---
+    ws2 = wb["Отчет по ТГ"]
+    tg_col_2 = find_col(ws2, "Товарная группа")
 
-    if tg_col_target:
-        for row in ws_target.iter_rows(min_row=2):
-            tg_cell = row[tg_col_target - 1]
+    if tg_col_2:
+        for row in ws2.iter_rows(min_row=2):
+            tg_cell = row[tg_col_2 - 1]
             if not tg_cell.value:
                 continue
             tg_name = str(tg_cell.value).strip()
             
             if tg_name in summary:
-                # 1. Вставляем сводные данные в T(20), U(21), V(22)
+                # Вставляем сводные данные в T(20), U(21), V(22)
                 if len(row) >= 22:
                     row[19].value = summary[tg_name]["delta"]
                     row[20].value = summary[tg_name]["retail"]
                     row[21].value = summary[tg_name]["purchase"]
-                
-                # 2. Прибавляем к существующим значениям в I(9), J(10), K(11)
+
+    # --- ЛИСТ 3: "Отчет по ТГ" → Прибавление к I(9), J(10), K(11) ---
+    ws3 = wb["Отчет по ТГ"]
+    tg_col_3 = find_col(ws3, "Товарная группа")
+
+    if tg_col_3:
+        for row in ws3.iter_rows(min_row=2):
+            tg_cell = row[tg_col_3 - 1]
+            if not tg_cell.value:
+                continue
+            tg_name = str(tg_cell.value).strip()
+            
+            if tg_name in summary:
+                # Прибавляем к существующим значениям в I(9), J(10), K(11)
                 base = existing_values.get(tg_name, {"i": 0, "j": 0, "k": 0})
                 if len(row) >= 11:
                     row[8].value = base["i"] + summary[tg_name]["delta"]
