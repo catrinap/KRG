@@ -27,7 +27,7 @@ async def process_excel(file: UploadFile = File(...)):
     wb_vals = openpyxl.load_workbook(BytesIO(contents), data_only=True)
     logger.info(f"Названия листов в файле: {wb_vals.sheetnames}")
     
-    # ИСПРАВЛЕНО: используем правильное название листа
+    # ИСПРАВЛЕНО: используем правильное название листа "Отчет по ТГ"
     ws3_vals = wb_vals["Отчет по ТГ"]
     
     tg_col_3v = find_col(ws3_vals, "Товарная группа")
