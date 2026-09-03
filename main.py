@@ -19,31 +19,16 @@ def find_col(ws, header_name):
 @app.post("/process")
 async def process_excel(file: UploadFile = File(...)):
     try:
-        # Читаем файл
         contents = await file.read()
+        logger.info(f"📥 Получен файл: {file.filename}, размер: {len(contents)} байт")
         
-        logger.info(f"📥 Получен файл: {file.filename}")
-        logger.info(f"📊 Размер: {len(contents)} байт")
-        logger.info(f"📋 Content-Type: {file.content_type}")
-        logger.info(f"🔍 Первые 100 байт: {contents[:100]}")
+        # ============================================================
+        # ПРОХОД 1: Быстрое чтение значений (read_only=True ускоряет процесс!)
+        # ============================================================
+        logger.info("🔄 Быстрое чтение файла (read_only=True)...")
+        wb_vals = openpyxl.load_workbook(BytesIO(contents), read_only=True, data_only=True)
         
-        # Проверяем, что это действительно Excel файл
-        if len(contents) < 4:
-            raise ValueError("Файл слишком маленький")
-        
-        # Проверяем сигнатуру ZIP файла (должна начинаться с PK)
-        if contents[:2] != b'PK':
-            logger.error(f"❌ Файл не является ZIP! Первые байты: {contents[:20]}")
-            raise ValueError("Передан не Excel файл (.xlsx). Возможно, передан JSON или текст.")
-        
-        # ПРОХОД 1: Читаем значения
-        logger.info("🔄 Открываю файл для чтения (data_only=True)...")
-        wb_vals = openpyxl.load_workbook(BytesIO(contents), data_only=True)
-        logger.info(f"📑 Листы: {wb_vals.sheetnames}")
-        
-        # ИСПРАВЛЕНО: используем правильное название листа
         ws3_vals = wb_vals["Отчет по ТГ"]
-        
         tg_col_3v = find_col(ws3_vals, "Товарная группа")
         existing_values = {}
 
@@ -54,7 +39,6 @@ async def process_excel(file: UploadFile = File(...)):
                     continue
                 tg_name = str(tg_cell.value).strip()
                 
-                # I=9, J=10, K=11 (индексы 8, 9, 10)
                 val_i = row[8].value if len(row) >= 9 else 0
                 val_j = row[9].value if len(row) >= 10 else 0
                 val_k = row[10].value if len(row) >= 11 else 0
@@ -64,14 +48,16 @@ async def process_excel(file: UploadFile = File(...)):
                     "j": float(val_j) if val_j is not None else 0,
                     "k": float(val_k) if val_k is not None else 0,
                 }
-        logger.info(f"✅ Прочитано {len(existing_values)} строк из 'Отчет по ТГ'")
         wb_vals.close()
+        logger.info(f"✅ Прочитано {len(existing_values)} строк")
 
-        # ПРОХОД 2: Модификация
-        logger.info("🔄 Открываю файл для записи (data_only=False)...")
-        wb = openpyxl.load_workbook(BytesIO(contents), data_only=False)
-        
-        logger.info(" Обрабатываю лист 'Данные КРГ'...")
+        # ============================================================
+        # ПРОХОД 2: Открытие для записи (отключаем тяжелые элементы для скорости)
+        # ============================================================
+        logger.info("🔄 Открытие файла для записи (оптимизировано)...")
+        wb = openpyxl.load_workbook(BytesIO(contents), keep_vba=False, keep_links=False)
+
+        logger.info("📊 Обработка листа 'Данные КРГ'...")
         ws1 = wb["Данные КРГ"]
         tg_col_1 = find_col(ws1, "Товарная группа")
         delta_col = find_col(ws1, "Дельта, шт.")
@@ -102,15 +88,15 @@ async def process_excel(file: UploadFile = File(...)):
                 summary[tg_name]["retail"] += r
                 summary[tg_name]["purchase"] += p
         
-        logger.info(f"✅ Сводная по {len(summary)} товарным группам")
+        logger.info(f"✅ Сводная собрана по {len(summary)} группам")
 
         # Запись данных
-        logger.info("✏️ Обновляю лист 'Отчет по ТГ'...")
+        logger.info("✏️ Обновление листа 'Отчет по ТГ'...")
         ws2 = wb["Отчет по ТГ"]
         tg_col_2 = find_col(ws2, "Товарная группа")
 
+        updated_count = 0
         if tg_col_2:
-            updated_count = 0
             for row in ws2.iter_rows(min_row=2):
                 tg_cell = row[tg_col_2 - 1]
                 if not tg_cell.value:
@@ -118,11 +104,13 @@ async def process_excel(file: UploadFile = File(...)):
                 tg_name = str(tg_cell.value).strip()
                 
                 if tg_name in summary:
+                    # 1. Вставляем сводные данные в T(20), U(21), V(22)
                     if len(row) >= 22:
                         row[19].value = summary[tg_name]["delta"]
                         row[20].value = summary[tg_name]["retail"]
                         row[21].value = summary[tg_name]["purchase"]
                     
+                    # 2. Прибавляем к существующим значениям в I(9), J(10), K(11)
                     base = existing_values.get(tg_name, {"i": 0, "j": 0, "k": 0})
                     if len(row) >= 11:
                         row[8].value = base["i"] + summary[tg_name]["delta"]
@@ -130,15 +118,15 @@ async def process_excel(file: UploadFile = File(...)):
                         row[10].value = base["k"] + summary[tg_name]["purchase"]
                     updated_count += 1
             
-            logger.info(f"✅ Обновлено {updated_count} строк")
+        logger.info(f"✅ Обновлено {updated_count} строк")
 
         # Сохранение
-        logger.info("💾 Сохраняю файл...")
+        logger.info("💾 Сохранение и отправка файла...")
         output = BytesIO()
         wb.save(output)
         output.seek(0)
         wb.close()
-        logger.info("✅ Файл сохранен успешно!")
+        logger.info("🎉 Файл успешно обработан и отправлен!")
 
         return StreamingResponse(
             output,
