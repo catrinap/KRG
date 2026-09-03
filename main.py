@@ -1,145 +1,132 @@
-"""
-Сервис обработки отчёта по инвентаризации для n8n.
-
-Принимает xlsx-файл (POST /process, multipart/form-data, поле "file"),
-делает свод по листу "Данные КРГ" в разрезе Товарной группы (Дельта,
-СуммаРозница, СуммаПриход), записывает свод в столбцы T/U/V листа
-"Отчет по ТГ" и прибавляет эти значения к столбцам I/J/K.
-Формулы и Excel-таблица на листе "Отчет по ТГ" не трогаются и остаются
-рабочими (openpyxl меняет только конкретные ячейки-значения).
-
-Запуск локально:  uvicorn main:app --host 0.0.0.0 --port 8000
-"""
-
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import StreamingResponse
+import openpyxl
 from io import BytesIO
 
-import openpyxl
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
-
-app = FastAPI(title="Inventory Report Processor")
-
-SHEET_DATA = "Данные КРГ"
-SHEET_REPORT = "Отчет по ТГ"
-
-# 0-based индексы столбцов на листе "Данные КРГ"
-COL_DATA_MAGAZIN = 0   # A
-COL_DATA_TG = 1        # B
-COL_DATA_DELTA = 11    # L
-COL_DATA_SUM_ROZ = 12  # M
-COL_DATA_SUM_PRIH = 13  # N
-
-# 0-based индексы столбцов на листе "Отчет по ТГ"
-COL_REPORT_MAGAZIN = 0   # A
-COL_REPORT_TG = 2        # C
-COL_REPORT_I = 8         # I - Фактический остаток, шт.
-COL_REPORT_J = 9         # J - Фактический остаток, розн. руб.
-COL_REPORT_K = 10        # K - Фактический остаток, приходные руб.
-COL_REPORT_T = 19        # T - Дельта КРГ, шт
-COL_REPORT_U = 20        # U - Дельта КРГ, розн. руб.
-COL_REPORT_V = 21        # V - Дельта КРГ, приходные руб.
+app = FastAPI()
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+def find_col(ws, header_name):
+    """Ищет номер столбца по названию заголовка в первой строке"""
+    for cell in ws[1]:
+        if cell.value and str(cell.value).strip() == header_name:
+            return cell.column
+    return None
 
 
 @app.post("/process")
-async def process_report(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
-        raise HTTPException(400, "Ожидается файл .xlsx")
-
+async def process_excel(file: UploadFile = File(...)):
     contents = await file.read()
 
-    try:
-        wb = openpyxl.load_workbook(BytesIO(contents), data_only=False)
-    except Exception as e:
-        raise HTTPException(400, f"Не удалось открыть файл: {e}")
+    # ============================================================
+    # ПРОХОД 1: Читаем вычисленные значения формул (data_only=True)
+    # Нужен для ячеек I, J, K листа "Готовый отчет по ТГ",
+    # если там формулы — получим их числовые результаты
+    # ============================================================
+    wb_vals = openpyxl.load_workbook(BytesIO(contents), data_only=True)
+    ws3_vals = wb_vals["Готовый отчет по ТГ"]
 
-    for sheet in (SHEET_DATA, SHEET_REPORT):
-        if sheet not in wb.sheetnames:
-            raise HTTPException(
-                400, f"На листе не найдена вкладка '{sheet}'. Есть: {wb.sheetnames}"
-            )
+    tg_col_3v = find_col(ws3_vals, "Товарная группа")
+    existing_values = {}
 
-    ws_data = wb[SHEET_DATA]
-    ws_report = wb[SHEET_REPORT]
+    if tg_col_3v:
+        for row in ws3_vals.iter_rows(min_row=2):
+            tg_cell = row[tg_col_3v - 1]  # openpyxl: 1-based, list: 0-based
+            if not tg_cell.value:
+                continue
+            tg_name = str(tg_cell.value).strip()
+            val_i = row[8].value   # Столбец I (9-й, индекс 8)
+            val_j = row[9].value   # Столбец J (10-й, индекс 9)
+            val_k = row[10].value  # Столбец K (11-й, индекс 10)
+            existing_values[tg_name] = {
+                "i": float(val_i) if val_i is not None else 0,
+                "j": float(val_j) if val_j is not None else 0,
+                "k": float(val_k) if val_k is not None else 0,
+            }
+    wb_vals.close()
 
-    # 1. Свод по (Магазин, Товарная группа)
-    pivot = {}
-    for row in ws_data.iter_rows(min_row=2, values_only=False):
-        magazin = row[COL_DATA_MAGAZIN].value
-        tg = row[COL_DATA_TG].value
-        if tg is None:
+    # ============================================================
+    # ПРОХОД 2: Открываем с data_only=False (формулы = строки)
+    # Модифицируем нужные ячейки. Все формулы, которые мы НЕ трогаем,
+    # физически остаются в файле неизменными.
+    # ============================================================
+    wb = openpyxl.load_workbook(BytesIO(contents), data_only=False)
+
+    # --- ЛИСТ 1: "Данные КРГ" → Сводная по ТГ ---
+    ws1 = wb["Данные КРГ"]
+
+    tg_col_1 = find_col(ws1, "Товарная группа")
+    delta_col = find_col(ws1, "Дельта")          # ⚠️ Подставь точное название заголовка!
+    retail_col = find_col(ws1, "СуммаРозница")    # ⚠️ Подставь точное название заголовка!
+    purchase_col = find_col(ws1, "СуммаПриход")   # ⚠️ Подставь точное название заголовка!
+
+    summary = {}
+
+    for row in ws1.iter_rows(min_row=2):
+        if not tg_col_1:
             continue
-        delta = row[COL_DATA_DELTA].value or 0
-        sum_roz = row[COL_DATA_SUM_ROZ].value or 0
-        sum_prih = row[COL_DATA_SUM_PRIH].value or 0
-
-        key = (magazin, tg)
-        agg = pivot.setdefault(key, {"delta": 0.0, "sum_roz": 0.0, "sum_prih": 0.0})
-        agg["delta"] += float(delta)
-        agg["sum_roz"] += float(sum_roz)
-        agg["sum_prih"] += float(sum_prih)
-
-    # 2. Проход по "Отчет по ТГ": запись T/U/V, прибавление к I/J/K
-    current_magazin = None
-    rows_updated = 0
-    for row in ws_report.iter_rows(min_row=2):
-        magazin_cell = row[COL_REPORT_MAGAZIN].value
-        tg = row[COL_REPORT_TG].value
-
-        if magazin_cell:
-            current_magazin = magazin_cell
-
-        # пропускаем пустые и итоговые строки ("Итого по магазину ...")
-        if not tg or "Итого" in str(tg):
+        tg_cell = row[tg_col_1 - 1]
+        if not tg_cell.value:
             continue
+        tg_name = str(tg_cell.value).strip()
 
-        key = (current_magazin, tg)
-        agg = pivot.get(key, {"delta": 0.0, "sum_roz": 0.0, "sum_prih": 0.0})
+        def safe_float(cell):
+            try:
+                return float(cell.value) if cell.value is not None else 0
+            except (ValueError, TypeError):
+                return 0
 
-        row[COL_REPORT_T].value = agg["delta"]
-        row[COL_REPORT_U].value = agg["sum_roz"]
-        row[COL_REPORT_V].value = agg["sum_prih"]
+        d = safe_float(row[delta_col - 1]) if delta_col else 0
+        r = safe_float(row[retail_col - 1]) if retail_col else 0
+        p = safe_float(row[purchase_col - 1]) if purchase_col else 0
 
-        i_val = row[COL_REPORT_I].value
-        j_val = row[COL_REPORT_J].value
-        k_val = row[COL_REPORT_K].value
-        i_val = i_val if isinstance(i_val, (int, float)) else 0
-        j_val = j_val if isinstance(j_val, (int, float)) else 0
-        k_val = k_val if isinstance(k_val, (int, float)) else 0
+        if tg_name not in summary:
+            summary[tg_name] = {"delta": 0, "retail": 0, "purchase": 0}
+        summary[tg_name]["delta"] += d
+        summary[tg_name]["retail"] += r
+        summary[tg_name]["purchase"] += p
 
-        row[COL_REPORT_I].value = i_val + agg["delta"]
-        row[COL_REPORT_J].value = j_val + agg["sum_roz"]
-        row[COL_REPORT_K].value = k_val + agg["sum_prih"]
+    # --- ЛИСТ 2: "Отчет по ТГ" → Вставка в столбцы T(20), U(21), V(22) ---
+    ws2 = wb["Отчет по ТГ"]
+    tg_col_2 = find_col(ws2, "Товарная группа")
 
-        rows_updated += 1
+    if tg_col_2:
+        for row in ws2.iter_rows(min_row=2):
+            tg_cell = row[tg_col_2 - 1]
+            if not tg_cell.value:
+                continue
+            tg_name = str(tg_cell.value).strip()
+            if tg_name in summary:
+                row[19].value = summary[tg_name]["delta"]     # T = 20, индекс 19
+                row[20].value = summary[tg_name]["retail"]    # U = 21, индекс 20
+                row[21].value = summary[tg_name]["purchase"]  # V = 22, индекс 21
 
-    # заставляем Excel пересчитать формулы (N-S) при открытии файла пользователем
-    wb.calculation.fullCalcOnLoad = True
+    # --- ЛИСТ 3: "Готовый отчет по ТГ" → Прибавление к I(9), J(10), K(11) ---
+    ws3 = wb["Готовый отчет по ТГ"]
+    tg_col_3 = find_col(ws3, "Товарная группа")
 
-    out = BytesIO()
-    wb.save(out)
-    out.seek(0)
+    if tg_col_3:
+        for row in ws3.iter_rows(min_row=2):
+            tg_cell = row[tg_col_3 - 1]
+            if not tg_cell.value:
+                continue
+            tg_name = str(tg_cell.value).strip()
+            if tg_name in summary:
+                base = existing_values.get(tg_name, {"i": 0, "j": 0, "k": 0})
+                row[8].value = base["i"] + summary[tg_name]["delta"]      # I = 9
+                row[9].value = base["j"] + summary[tg_name]["retail"]     # J = 10
+                row[10].value = base["k"] + summary[tg_name]["purchase"]  # K = 11
 
-    out_filename = file.filename.rsplit(".", 1)[0] + "_готово.xlsx"
-    # кириллица в имени файла не кодируется как latin-1 в обычном
-    # filename=, поэтому используем filename* (RFC 5987) + ASCII-фолбэк
-    from urllib.parse import quote
-
-    ascii_fallback = "report_done.xlsx"
-    encoded_name = quote(out_filename)
+    # ============================================================
+    # Сохраняем и возвращаем файл
+    # ============================================================
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    wb.close()
 
     return StreamingResponse(
-        out,
+        output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": (
-                f'attachment; filename="{ascii_fallback}"; '
-                f"filename*=UTF-8''{encoded_name}"
-            ),
-            "X-Rows-Updated": str(rows_updated),
-        },
+        headers={"Content-Disposition": 'attachment; filename="Result.xlsx"'}
     )
