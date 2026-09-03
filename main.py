@@ -11,38 +11,50 @@ app = FastAPI()
 
 def find_col(ws, header_name):
     """Ищет номер столбца по названию заголовка"""
-    logger.info(f"Ищу столбец: {header_name}")
     for cell in ws[1]:
         if cell.value and str(cell.value).strip().lower() == header_name.strip().lower():
-            logger.info(f"Найден столбец {header_name} в позиции {cell.column}")
             return cell.column
-    logger.warning(f"Столбец {header_name} НЕ НАЙДЕН!")
     return None
 
 @app.post("/process")
 async def process_excel(file: UploadFile = File(...)):
     try:
-        logger.info(f"📥 Получен файл: {file.filename}, размер: {len(await file.read())} байт")
+        # Читаем файл
         contents = await file.read()
+        
+        logger.info(f"📥 Получен файл: {file.filename}")
+        logger.info(f"📊 Размер: {len(contents)} байт")
+        logger.info(f"📋 Content-Type: {file.content_type}")
+        logger.info(f"🔍 Первые 100 байт: {contents[:100]}")
+        
+        # Проверяем, что это действительно Excel файл
+        if len(contents) < 4:
+            raise ValueError("Файл слишком маленький")
+        
+        # Проверяем сигнатуру ZIP файла (должна начинаться с PK)
+        if contents[:2] != b'PK':
+            logger.error(f"❌ Файл не является ZIP! Первые байты: {contents[:20]}")
+            raise ValueError("Передан не Excel файл (.xlsx). Возможно, передан JSON или текст.")
         
         # ПРОХОД 1: Читаем значения
         logger.info("🔄 Открываю файл для чтения (data_only=True)...")
         wb_vals = openpyxl.load_workbook(BytesIO(contents), data_only=True)
-        logger.info(f" Листы: {wb_vals.sheetnames}")
+        logger.info(f"📑 Листы: {wb_vals.sheetnames}")
         
-        logger.info("🔍 Открываю лист 'Отчет по ТГ'...")
+        # ИСПРАВЛЕНО: используем правильное название листа
         ws3_vals = wb_vals["Отчет по ТГ"]
         
-        logger.info("📊 Читаю существующие значения I, J, K...")
         tg_col_3v = find_col(ws3_vals, "Товарная группа")
         existing_values = {}
-        
+
         if tg_col_3v:
             for row in ws3_vals.iter_rows(min_row=2):
                 tg_cell = row[tg_col_3v - 1]
                 if not tg_cell.value:
                     continue
                 tg_name = str(tg_cell.value).strip()
+                
+                # I=9, J=10, K=11 (индексы 8, 9, 10)
                 val_i = row[8].value if len(row) >= 9 else 0
                 val_j = row[9].value if len(row) >= 10 else 0
                 val_k = row[10].value if len(row) >= 11 else 0
